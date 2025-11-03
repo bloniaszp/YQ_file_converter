@@ -8,10 +8,51 @@ from datetime import datetime, timedelta
 from typing import Dict, Tuple, List
 import pandas as pd
 
-st.set_page_config(page_title="EmotiBit → YQ Converter", layout="centered")
-st.title("EmotiBit → YQ Conversion App")
-st.caption("Upload a ZIP that has a CSV + matching *_info.json (we handle weird macOS filenames).")
+# --------------------------------------------------
+# PAGE CONFIG + LIGHT STYLING
+# --------------------------------------------------
+st.set_page_config(page_title="EmotiBit → YQ Converter", page_icon="📦", layout="centered")
 
+# global CSS
+st.markdown(
+    """
+    <style>
+    /* take away default top padding */
+    .block-container {padding-top: 1.5rem; max-width: 900px;}
+    /* header */
+    .hero {
+        background: radial-gradient(circle at top, #2563eb 0%, #0f172a 45%, #0f172a 100%);
+        border-radius: 18px;
+        padding: 1.6rem 1.75rem 1.3rem 1.75rem;
+        color: white;
+        margin-bottom: 1.25rem;
+        box-shadow: 0 15px 35px rgba(0,0,0,0.12);
+    }
+    .hero-title {font-size: 1.6rem; font-weight: 700; margin-bottom: 0.35rem;}
+    .hero-sub {opacity: 0.8; font-size: 0.9rem;}
+    /* upload card */
+    .card {
+        background: white;
+        border: 1px solid rgba(15,23,42,0.06);
+        border-radius: 14px;
+        padding: 1.25rem 1.35rem 1.15rem 1.35rem;
+        box-shadow: 0 8px 20px rgba(15,23,42,0.03);
+        margin-bottom: 1rem;
+    }
+    /* footer */
+    .footer {
+        text-align: center;
+        color: #94a3b8;
+        font-size: 0.75rem;
+        margin-top: 2.5rem;
+    }
+    /* hide main menu & footer */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # --------------------------------------------------
 # 1. JSON parsing
@@ -59,15 +100,10 @@ def load_emotibit_json(json_path: str) -> Tuple[dict, Dict[str, dict]]:
 
     return device_meta, channels
 
-
 # --------------------------------------------------
 # 2. CSV parsing
 # --------------------------------------------------
-def parse_emotibit_csv(
-    csv_path: str,
-    device_created_at: str,
-    channels_meta: Dict[str, dict],
-) -> pd.DataFrame:
+def parse_emotibit_csv(csv_path: str, device_created_at: str, channels_meta: Dict[str, dict]) -> pd.DataFrame:
     base_dt = None
     if device_created_at:
         base_dt = datetime.strptime(device_created_at, "%Y-%m-%d_%H-%M-%S-%f")
@@ -95,7 +131,6 @@ def parse_emotibit_csv(
 
             values = parts[6:]
             if tag not in channels_meta:
-                # skip non-sensor packets
                 continue
 
             ch_meta = channels_meta.get(tag, {})
@@ -128,7 +163,6 @@ def parse_emotibit_csv(
     first_ts = df_wide["timestamp"].iloc[0]
     df_wide.insert(1, "Time", (df_wide["timestamp"] - first_ts) / 1000.0)
 
-    # rename from json
     rename_map = {}
     for tag, meta in channels_meta.items():
         if tag in df_wide.columns:
@@ -137,16 +171,14 @@ def parse_emotibit_csv(
 
     return df_wide
 
-
 # --------------------------------------------------
-# 3. YQ-like output
+# 3. YQ writer
 # --------------------------------------------------
 def write_yq_folder(out_dir: str, device_df: pd.DataFrame, device_meta: dict):
     os.makedirs(out_dir, exist_ok=True)
 
     device_id = device_meta.get("__device_id__", device_meta.get("device_id", "emotibit_device"))
     device_name = device_meta.get("__device_name__", device_meta.get("name", "EmotiBit"))
-
     fn_stub = device_id.lower().replace(" ", "_")
     device_csv_name = f"{fn_stub}_device.csv"
 
@@ -186,70 +218,46 @@ This folder contains the following files: {device_csv_name}, metadata.csv
     )
     meta_df.to_csv(os.path.join(out_dir, "metadata.csv"), index=False)
 
-
 # --------------------------------------------------
-# 4. Helper: robust session finder
+# 4. Robust matcher
 # --------------------------------------------------
 def find_emotibit_sessions(root_dir: str) -> List[dict]:
-    """
-    Return a list of {json: ..., csv: ..., name: ...} for all pairs found.
-    We handle filenames like:
-        "2025-10-31_13-14-11-556675 7.24.17 PM.csv"
-        "2025-10-31_13-14-11-556675_info 7.24.17 PM.json"
-    i.e. extra stuff after the base name.
-    """
-    all_jsons = []
-    all_csvs = []
+    all_jsons, all_csvs = [], []
     for root, _, files in os.walk(root_dir):
         if "__MACOSX" in root:
             continue
         for f in files:
             if f.startswith("._"):
                 continue
-            full = os.path.join(root, f)
-            if f.lower().endswith(".json") and "_info" in f:
-                all_jsons.append(full)
+            fp = os.path.join(root, f)
+            if f.lower().endswith(".json") and "_info" in f.lower():
+                all_jsons.append(fp)
             elif f.lower().endswith(".csv"):
-                all_csvs.append(full)
+                all_csvs.append(fp)
 
     sessions = []
     for json_path in all_jsons:
-        json_name = os.path.basename(json_path)
-        stem = os.path.splitext(json_name)[0]  # e.g. "2025-10-31..._info 7.24.17 PM"
-        # find the part BEFORE "_info"
-        info_idx = stem.lower().find("_info")
-        if info_idx == -1:
+        stem = os.path.splitext(os.path.basename(json_path))[0]
+        idx = stem.lower().find("_info")
+        if idx == -1:
             continue
-        base_key = stem[:info_idx]  # e.g. "2025-10-31_13-14-11-556675"
+        base_key = stem[:idx]
 
-        # now find csv whose stem STARTS with that base_key
+        # match csv that starts with base_key
         candidates = []
         for csv_path in all_csvs:
             csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
             if csv_stem.startswith(base_key):
                 candidates.append(csv_path)
-
         if not candidates:
-            # no csv for this json → skip
             continue
-
-        # pick the shortest name (usually the real one)
         candidates.sort(key=lambda p: len(os.path.basename(p)))
         csv_path = candidates[0]
-
-        sessions.append(
-            {
-                "json": json_path,
-                "csv": csv_path,
-                "name": base_key,
-            }
-        )
-
+        sessions.append({"json": json_path, "csv": csv_path, "name": base_key})
     return sessions
 
-
 # --------------------------------------------------
-# 5. zip
+# 5. ZIP helper
 # --------------------------------------------------
 def zip_directory(src_dir: str) -> bytes:
     buf = io.BytesIO()
@@ -262,14 +270,32 @@ def zip_directory(src_dir: str) -> bytes:
     buf.seek(0)
     return buf.read()
 
+# --------------------------------------------------
+# HERO
+# --------------------------------------------------
+st.markdown(
+    """
+    <div class="hero">
+      <div class="hero-title">📦 EmotiBit → You:Quantified converter</div>
+      <div class="hero-sub">Drop an EmotiBit export (.zip) → get a YQ-style folder (.zip) you can upload.</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # --------------------------------------------------
-# 6. UI
+# UPLOAD CARD
 # --------------------------------------------------
-uploaded = st.file_uploader("Upload EmotiBit ZIP", type=["zip"])
+with st.container():
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    uploaded = st.file_uploader("Upload EmotiBit ZIP", type=["zip"])
+    st.markdown('</div>', unsafe_allow_html=True)
 
+# --------------------------------------------------
+# MAIN LOGIC
+# --------------------------------------------------
 if uploaded is not None:
-    st.info(f"Received ZIP: {uploaded.name} ({uploaded.size/1024:.1f} kB)")
+    st.info(f"📁 Received: **{uploaded.name}** ({uploaded.size/1024:.1f} kB)")
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -282,23 +308,19 @@ if uploaded is not None:
             with zipfile.ZipFile(in_zip_path, "r") as z:
                 z.extractall(extract_dir)
 
-            # show contents
             found_files = []
             for root, _, files in os.walk(extract_dir):
                 for f in files:
                     rel = os.path.relpath(os.path.join(root, f), extract_dir)
                     found_files.append(rel)
-            st.write("Files inside ZIP:")
-            st.code("\n".join(found_files) or "(empty)")
 
-            # find sessions robustly
+            with st.expander("📄 Files inside uploaded ZIP", expanded=False):
+                st.code("\n".join(found_files) or "(empty)")
+
             sessions = find_emotibit_sessions(extract_dir)
 
             if not sessions:
-                st.error(
-                    "I couldn't find any matching `<something>.csv` + `<something>_info*.json` pair in your ZIP. "
-                    "Make sure both files are inside the ZIP (we ignore __MACOSX files)."
-                )
+                st.error("😕 I couldn't find any `<something>.csv` + `<something>_info*.json` pair. Check the ZIP and try again.")
             else:
                 yq_out_dir = os.path.join(tmpdir, "YQ_out")
                 os.makedirs(yq_out_dir, exist_ok=True)
@@ -313,14 +335,20 @@ if uploaded is not None:
                     write_yq_folder(sess_out_dir, df_device, device_meta)
 
                 final_zip = zip_directory(yq_out_dir)
-                st.success("✅ Conversion complete.")
+                st.success(f"✅ Converted **{len(sessions)}** session(s).")
                 st.download_button(
-                    "Download YQ_out.zip",
+                    "⬇️ Download YQ_out.zip",
                     data=final_zip,
                     file_name="YQ_out.zip",
                     mime="application/zip",
+                    use_container_width=True,
                 )
 
     except Exception as e:
-        st.error("Error during conversion — details below.")
+        st.error("🚨 Error during conversion.")
         st.exception(e)
+
+# --------------------------------------------------
+# FOOTER
+# --------------------------------------------------
+st.markdown('<div class="footer">Built for EmotiBit → YQ data pipelines.</div>', unsafe_allow_html=True)
