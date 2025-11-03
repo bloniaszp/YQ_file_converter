@@ -5,25 +5,18 @@ import os
 import io
 import json
 from datetime import datetime, timedelta
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 import pandas as pd
 
 st.set_page_config(page_title="EmotiBit → YQ Converter", layout="centered")
 st.title("EmotiBit → YQ Conversion App")
-st.caption("Upload a ZIP that has `<session>.csv` + `<session>_info.json`")
+st.caption("Upload a ZIP that has a CSV + matching *_info.json (we handle weird macOS filenames).")
 
 
 # --------------------------------------------------
 # 1. JSON parsing
 # --------------------------------------------------
 def load_emotibit_json(json_path: str) -> Tuple[dict, Dict[str, dict]]:
-    """
-    Parse an EmotiBit *_info.json like the one you showed.
-
-    Returns:
-    - device_meta: things like name, device_id, source_id, created_at...
-    - channels: tag -> metadata (to rename columns)
-    """
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -148,23 +141,15 @@ def parse_emotibit_csv(
 # --------------------------------------------------
 # 3. YQ-like output
 # --------------------------------------------------
-README_TEMPLATE = """Hi! I'm a small file meant to describe the contents of your folder.
-
-You: Quantified saves the data recorded from each of your devices as separate "csv" files. There is an additional file with the metadata for each device.
-""".strip()
-
 def write_yq_folder(out_dir: str, device_df: pd.DataFrame, device_meta: dict):
     os.makedirs(out_dir, exist_ok=True)
 
-    # pull normalized fields we added in load_emotibit_json
     device_id = device_meta.get("__device_id__", device_meta.get("device_id", "emotibit_device"))
     device_name = device_meta.get("__device_name__", device_meta.get("name", "EmotiBit"))
 
-    # YQ-style CSV name from device_id
     fn_stub = device_id.lower().replace(" ", "_")
     device_csv_name = f"{fn_stub}_device.csv"
 
-    # README that lists the actual files
     readme_text = f"""Hi! I'm a small file meant to describe the contents of your folder. 
 
 You: Quantified saves the data recorded from each of your devices as separate "csv" files. There is an additional file with the metadata for each device.
@@ -187,7 +172,6 @@ This folder contains the following files: {device_csv_name}, metadata.csv
         if not diffs.empty and diffs.median() > 0:
             sampling_rate_guess = round(1.0 / diffs.median())
 
-    # metadata.csv — use the REAL name from JSON
     meta_df = pd.DataFrame(
         [
             {
@@ -204,7 +188,68 @@ This folder contains the following files: {device_csv_name}, metadata.csv
 
 
 # --------------------------------------------------
-# 4. zip
+# 4. Helper: robust session finder
+# --------------------------------------------------
+def find_emotibit_sessions(root_dir: str) -> List[dict]:
+    """
+    Return a list of {json: ..., csv: ..., name: ...} for all pairs found.
+    We handle filenames like:
+        "2025-10-31_13-14-11-556675 7.24.17 PM.csv"
+        "2025-10-31_13-14-11-556675_info 7.24.17 PM.json"
+    i.e. extra stuff after the base name.
+    """
+    all_jsons = []
+    all_csvs = []
+    for root, _, files in os.walk(root_dir):
+        if "__MACOSX" in root:
+            continue
+        for f in files:
+            if f.startswith("._"):
+                continue
+            full = os.path.join(root, f)
+            if f.lower().endswith(".json") and "_info" in f:
+                all_jsons.append(full)
+            elif f.lower().endswith(".csv"):
+                all_csvs.append(full)
+
+    sessions = []
+    for json_path in all_jsons:
+        json_name = os.path.basename(json_path)
+        stem = os.path.splitext(json_name)[0]  # e.g. "2025-10-31..._info 7.24.17 PM"
+        # find the part BEFORE "_info"
+        info_idx = stem.lower().find("_info")
+        if info_idx == -1:
+            continue
+        base_key = stem[:info_idx]  # e.g. "2025-10-31_13-14-11-556675"
+
+        # now find csv whose stem STARTS with that base_key
+        candidates = []
+        for csv_path in all_csvs:
+            csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
+            if csv_stem.startswith(base_key):
+                candidates.append(csv_path)
+
+        if not candidates:
+            # no csv for this json → skip
+            continue
+
+        # pick the shortest name (usually the real one)
+        candidates.sort(key=lambda p: len(os.path.basename(p)))
+        csv_path = candidates[0]
+
+        sessions.append(
+            {
+                "json": json_path,
+                "csv": csv_path,
+                "name": base_key,
+            }
+        )
+
+    return sessions
+
+
+# --------------------------------------------------
+# 5. zip
 # --------------------------------------------------
 def zip_directory(src_dir: str) -> bytes:
     buf = io.BytesIO()
@@ -217,8 +262,9 @@ def zip_directory(src_dir: str) -> bytes:
     buf.seek(0)
     return buf.read()
 
+
 # --------------------------------------------------
-# 5. UI
+# 6. UI
 # --------------------------------------------------
 uploaded = st.file_uploader("Upload EmotiBit ZIP", type=["zip"])
 
@@ -236,6 +282,7 @@ if uploaded is not None:
             with zipfile.ZipFile(in_zip_path, "r") as z:
                 z.extractall(extract_dir)
 
+            # show contents
             found_files = []
             for root, _, files in os.walk(extract_dir):
                 for f in files:
@@ -244,37 +291,14 @@ if uploaded is not None:
             st.write("Files inside ZIP:")
             st.code("\n".join(found_files) or "(empty)")
 
-            looks_like_yq = any(f.endswith("_device.csv") for f in found_files) and "metadata.csv" in {
-                os.path.basename(x) for x in found_files
-            }
-
-            sessions = []
-            for root, _, files in os.walk(extract_dir):
-                if "__MACOSX" in root:
-                    continue
-                for f in files:
-                    if f.startswith("._"):
-                        continue
-                    if f.endswith("_info.json"):
-                        base = f.replace("_info.json", "")
-                        csv_candidate = os.path.join(root, base + ".csv")
-                        if os.path.exists(csv_candidate):
-                            sessions.append(
-                                {
-                                    "json": os.path.join(root, f),
-                                    "csv": csv_candidate,
-                                    "name": base,
-                                }
-                            )
+            # find sessions robustly
+            sessions = find_emotibit_sessions(extract_dir)
 
             if not sessions:
-                if looks_like_yq:
-                    st.error(
-                        "This ZIP already looks like **YQ output** (it has a `*_device.csv` and `metadata.csv`). "
-                        "Upload the **original EmotiBit** ZIP instead — the one with `<session>.csv` and `<session>_info.json`."
-                    )
-                else:
-                    st.error("I couldn't find any `<name>.csv` + `<name>_info.json` pair in your ZIP (I ignored __MACOSX files).")
+                st.error(
+                    "I couldn't find any matching `<something>.csv` + `<something>_info*.json` pair in your ZIP. "
+                    "Make sure both files are inside the ZIP (we ignore __MACOSX files)."
+                )
             else:
                 yq_out_dir = os.path.join(tmpdir, "YQ_out")
                 os.makedirs(yq_out_dir, exist_ok=True)
