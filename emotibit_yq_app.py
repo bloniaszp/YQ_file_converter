@@ -273,7 +273,7 @@ def write_yq_folder(out_dir: str, dataframes_with_meta: List[Tuple[pd.DataFrame,
     csv_list_str = ", ".join(csv_files)
     readme_text = f"""Hi! I'm a small file meant to describe the contents of your folder. 
 
-You: Quantified saves the data recorded from each of your devices as separate "csv" files. There is an additional file with the metadata for each device.
+YouQuantified saves the data recorded from each of your devices as separate "csv" files. There is an additional file with the metadata for each device.
 
 The data gathered from the web browser can have unreliable time synchrony or sampling rates, so be aware of its usage for research purposes. 
 
@@ -411,10 +411,15 @@ if uploaded is not None:
 
                 final_zip = zip_directory(yq_out_dir)
                 st.success(f"✅ Converted **{len(sessions)}** session(s).")
+                
+                # Create a clear, readable filename for the output ZIP based on input filename
+                input_filename_base = os.path.splitext(uploaded.name)[0] if uploaded.name else "YQ_out"
+                output_zip_name = f"{input_filename_base}_converted.zip"
+                
                 st.download_button(
-                    "⬇️ Download YQ_out.zip",
+                    f"⬇️ Download {output_zip_name}",
                     data=final_zip,
-                    file_name="YQ_out.zip",
+                    file_name=output_zip_name,
                     mime="application/zip",
                     use_container_width=True,
                 )
