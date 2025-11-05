@@ -421,6 +421,8 @@ if uploaded is not None:
                 yq_out_dir = os.path.join(tmpdir, "YQ_out")
                 os.makedirs(yq_out_dir, exist_ok=True)
 
+                # Collect all files from all sessions into a single folder
+                # This ensures the ZIP structure matches what the upload validation expects
                 for sess in sessions:
                     device_meta, channels = load_emotibit_json(sess["json"])
                     created_at = device_meta.get("created_at", None)
@@ -430,9 +432,8 @@ if uploaded is not None:
                         st.warning(f"⚠️ No data found for session: {sess['name']}")
                         continue
 
-                    sess_out_dir = os.path.join(yq_out_dir, sess["name"])
-                    os.makedirs(sess_out_dir, exist_ok=True)
-                    write_yq_folder(sess_out_dir, dataframes_with_meta, device_meta)
+                    # Write directly to root folder (no subfolders)
+                    write_yq_folder(yq_out_dir, dataframes_with_meta, device_meta)
 
                 final_zip = zip_directory(yq_out_dir)
                 st.success(f"✅ Converted **{len(sessions)}** session(s).")
