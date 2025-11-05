@@ -189,22 +189,47 @@ def parse_emotibit_csv(csv_path: str, device_created_at: str, channels_meta: Dic
             .reset_index()
         )
         
-        # Ensure no NAs - forward fill and then backward fill if needed
-        df_wide = df_wide.ffill().bfill()
-        
-        # Remove any remaining rows with NAs
-        df_wide = df_wide.dropna()
-        
         if df_wide.empty:
             continue
         
-        # Rename columns using channel labels
-        rename_map = {}
-        for tag in tags_in_group:
-            if tag in df_wide.columns:
-                meta = channels_meta.get(tag, {})
-                rename_map[tag] = meta.get("label", tag)
-        df_wide = df_wide.rename(columns=rename_map)
+        # Create a regular timestamp grid for continuous data
+        # Use the nominal sampling rate to create evenly spaced timestamps
+        min_ts = df_wide["timestamp"].min()
+        max_ts = df_wide["timestamp"].max()
+        interval_ms = int(1000.0 / sr)  # milliseconds between samples at this sampling rate
+        
+        # Generate regular timestamp grid
+        regular_timestamps = pd.Series(range(min_ts, max_ts + interval_ms, interval_ms))
+        
+        # Reindex dataframe to regular grid (this creates NAs for missing timestamps)
+        df_wide = df_wide.set_index("timestamp")
+        df_wide = df_wide.reindex(regular_timestamps)
+        df_wide = df_wide.reset_index()
+        df_wide = df_wide.rename(columns={"index": "timestamp"})
+        
+        # Fill gaps using interpolation strategy:
+        # 1. Forward fill to propagate last known values
+        # 2. Backward fill to fill any leading gaps
+        # 3. Linear interpolation for any remaining gaps
+        data_cols = [col for col in df_wide.columns if col != "timestamp"]
+        
+        for col in data_cols:
+            # Forward fill
+            df_wide[col] = df_wide[col].ffill()
+            # Backward fill (for any leading NAs)
+            df_wide[col] = df_wide[col].bfill()
+            # Linear interpolation for any remaining gaps (shouldn't be any, but safety)
+            if df_wide[col].isna().any():
+                df_wide[col] = df_wide[col].interpolate(method='linear', limit_direction='both')
+            # Final safety: if any NAs remain, fill with 0 (shouldn't happen)
+            df_wide[col] = df_wide[col].fillna(0)
+        
+        # Verify no NAs remain
+        assert df_wide[data_cols].isna().sum().sum() == 0, "Data should have no NAs after filling"
+        
+        # Keep column names as tags (matching YQ format - simple tag names, not full labels)
+        # The tags are already unique and readable (e.g., "TP10", "AF8", "EA", "AX", etc.)
+        # No renaming needed - tags are already the column names
         
         # Determine type name from channel metadata
         # Use the channel "name" from the first channel in the group
