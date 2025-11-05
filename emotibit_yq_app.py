@@ -103,7 +103,11 @@ def load_emotibit_json(json_path: str) -> Tuple[dict, Dict[str, dict]]:
 # --------------------------------------------------
 # 2. CSV parsing
 # --------------------------------------------------
-def parse_emotibit_csv(csv_path: str, device_created_at: str, channels_meta: Dict[str, dict]) -> pd.DataFrame:
+def parse_emotibit_csv(csv_path: str, device_created_at: str, channels_meta: Dict[str, dict]) -> List[Tuple[pd.DataFrame, float, str, List[str]]]:
+    """
+    Parse EmotiBit CSV and return dataframes grouped by sampling rate.
+    Returns: List of (dataframe, sampling_rate, type_name, tags_in_group) tuples
+    """
     base_dt = None
     if device_created_at:
         base_dt = datetime.strptime(device_created_at, "%Y-%m-%d_%H-%M-%S-%f")
@@ -151,71 +155,138 @@ def parse_emotibit_csv(csv_path: str, device_created_at: str, channels_meta: Dic
                 records.append({"timestamp": ts_ms, "tag": tag, "value": v})
 
     if not records:
-        return pd.DataFrame(columns=["timestamp"])
+        return []
 
+    # Group channels by sampling rate
     df_long = pd.DataFrame.from_records(records)
-    df_wide = (
-        df_long.pivot_table(index="timestamp", columns="tag", values="value", aggfunc="mean")
-        .sort_index()
-        .reset_index()
-    )
-
-    first_ts = df_wide["timestamp"].iloc[0]
-    df_wide.insert(1, "Time", (df_wide["timestamp"] - first_ts) / 1000.0)
-
-    rename_map = {}
+    
+    # Get unique sampling rates for each tag
+    tag_sr_map = {}
     for tag, meta in channels_meta.items():
-        if tag in df_wide.columns:
-            rename_map[tag] = meta.get("label", tag)
-    df_wide = df_wide.rename(columns=rename_map)
-
-    return df_wide
+        tag_sr_map[tag] = meta.get("nominal_srate") or 25.0
+    
+    # Group tags by sampling rate
+    sr_groups: Dict[float, List[str]] = {}
+    for tag in df_long["tag"].unique():
+        sr = tag_sr_map.get(tag, 25.0)
+        if sr not in sr_groups:
+            sr_groups[sr] = []
+        sr_groups[sr].append(tag)
+    
+    # Create separate dataframe for each sampling rate group
+    result = []
+    for sr, tags_in_group in sr_groups.items():
+        # Filter records for this group
+        df_group = df_long[df_long["tag"].isin(tags_in_group)].copy()
+        
+        if df_group.empty:
+            continue
+        
+        # Create wide format dataframe
+        df_wide = (
+            df_group.pivot_table(index="timestamp", columns="tag", values="value", aggfunc="mean")
+            .sort_index()
+            .reset_index()
+        )
+        
+        # Ensure no NAs - forward fill and then backward fill if needed
+        df_wide = df_wide.ffill().bfill()
+        
+        # Remove any remaining rows with NAs
+        df_wide = df_wide.dropna()
+        
+        if df_wide.empty:
+            continue
+        
+        # Rename columns using channel labels
+        rename_map = {}
+        for tag in tags_in_group:
+            if tag in df_wide.columns:
+                meta = channels_meta.get(tag, {})
+                rename_map[tag] = meta.get("label", tag)
+        df_wide = df_wide.rename(columns=rename_map)
+        
+        # Determine type name from channel metadata
+        # Use the channel "name" from the first channel in the group
+        type_name = "physio"
+        if tags_in_group:
+            first_tag = tags_in_group[0]
+            first_meta = channels_meta.get(first_tag, {})
+            raw_info = first_meta.get("raw_info", {})
+            type_name = raw_info.get("name") or raw_info.get("type") or "physio"
+        
+        result.append((df_wide, sr, type_name, tags_in_group))
+    
+    return result
 
 # --------------------------------------------------
 # 3. YQ writer
 # --------------------------------------------------
-def write_yq_folder(out_dir: str, device_df: pd.DataFrame, device_meta: dict):
+def write_yq_folder(out_dir: str, dataframes_with_meta: List[Tuple[pd.DataFrame, float, str, List[str]]], device_meta: dict):
+    """
+    Write YQ folder with separate CSV files for each sampling rate group.
+    dataframes_with_meta: List of (dataframe, sampling_rate, type_name, tags_in_group) tuples
+    """
     os.makedirs(out_dir, exist_ok=True)
 
     device_id = device_meta.get("__device_id__", device_meta.get("device_id", "emotibit_device"))
     device_name = device_meta.get("__device_name__", device_meta.get("name", "EmotiBit"))
     fn_stub = device_id.lower().replace(" ", "_")
-    device_csv_name = f"{fn_stub}_device.csv"
 
+    # Write CSV files and collect metadata
+    csv_files = []
+    metadata_rows = []
+    
+    for df, sampling_rate, type_name, tags_in_group in dataframes_with_meta:
+        # Create filename from type name
+        type_name_safe = type_name.lower().replace(" ", "_").replace("-", "_")
+        csv_name = f"{fn_stub}_{type_name_safe}.csv"
+        csv_path = os.path.join(out_dir, csv_name)
+        
+        # Ensure timestamp is the last column (per YQ format)
+        cols = [col for col in df.columns if col != "timestamp"]
+        if "timestamp" in df.columns:
+            cols.append("timestamp")
+        df_output = df[cols]
+        
+        df_output.to_csv(csv_path, index=False)
+        csv_files.append(csv_name)
+        
+        # Calculate actual sampling rate from data if available
+        actual_sr = int(sampling_rate) if sampling_rate else 0
+        if "timestamp" in df.columns and len(df) > 1:
+            diffs = df["timestamp"].diff().dropna()
+            if not diffs.empty and diffs.median() > 0:
+                actual_sr = round(1000.0 / diffs.median())  # timestamps are in milliseconds
+        
+        # Create metadata row
+        metadata_rows.append({
+            "recording id": f"{device_id} : {type_name}",
+            "file name": csv_name,
+            "device id": device_id,
+            "device name": device_name,
+            "type": type_name,
+            "sampling_rate": actual_sr,
+        })
+    
+    # Write README
+    csv_list_str = ", ".join(csv_files)
     readme_text = f"""Hi! I'm a small file meant to describe the contents of your folder. 
 
 You: Quantified saves the data recorded from each of your devices as separate "csv" files. There is an additional file with the metadata for each device.
 
 The data gathered from the web browser can have unreliable time synchrony or sampling rates, so be aware of its usage for research purposes. 
 
-If you have questions or suggestions, please visit the repository at https://github.com/esromerog/You-Quantified.
+If you have questions or suggestions, please visit the repository at https://github.com/mindhiveproject/You-Quantified.
 
-This folder contains the following files: {device_csv_name}, metadata.csv
+This folder contains the following files: {csv_list_str}, metadata.csv
 """.strip()
 
     with open(os.path.join(out_dir, "README.txt"), "w", encoding="utf-8") as f:
         f.write(readme_text)
 
-    device_df.to_csv(os.path.join(out_dir, device_csv_name), index=False)
-
-    sampling_rate_guess = 0
-    if "Time" in device_df.columns and len(device_df) > 1:
-        diffs = device_df["Time"].diff().dropna()
-        if not diffs.empty and diffs.median() > 0:
-            sampling_rate_guess = round(1.0 / diffs.median())
-
-    meta_df = pd.DataFrame(
-        [
-            {
-                "recording id": f"{device_id} : device",
-                "file name": device_csv_name,
-                "device id": device_id,
-                "device name": device_name,
-                "type": "physio",
-                "sampling_rate": sampling_rate_guess,
-            }
-        ]
-    )
+    # Write metadata CSV
+    meta_df = pd.DataFrame(metadata_rows)
     meta_df.to_csv(os.path.join(out_dir, "metadata.csv"), index=False)
 
 # --------------------------------------------------
@@ -328,11 +399,15 @@ if uploaded is not None:
                 for sess in sessions:
                     device_meta, channels = load_emotibit_json(sess["json"])
                     created_at = device_meta.get("created_at", None)
-                    df_device = parse_emotibit_csv(sess["csv"], created_at, channels)
+                    dataframes_with_meta = parse_emotibit_csv(sess["csv"], created_at, channels)
+
+                    if not dataframes_with_meta:
+                        st.warning(f"⚠️ No data found for session: {sess['name']}")
+                        continue
 
                     sess_out_dir = os.path.join(yq_out_dir, sess["name"])
                     os.makedirs(sess_out_dir, exist_ok=True)
-                    write_yq_folder(sess_out_dir, df_device, device_meta)
+                    write_yq_folder(sess_out_dir, dataframes_with_meta, device_meta)
 
                 final_zip = zip_directory(yq_out_dir)
                 st.success(f"✅ Converted **{len(sessions)}** session(s).")
