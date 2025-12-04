@@ -157,90 +157,61 @@ def parse_emotibit_csv(csv_path: str, device_created_at: str, channels_meta: Dic
     if not records:
         return []
 
-    # Group channels by sampling rate
+    # -----------------------------
+    # Group channels by (type, sampling rate) instead of sampling rate alone
+    # -----------------------------
     df_long = pd.DataFrame.from_records(records)
-    
-    # Get unique sampling rates for each tag
-    tag_sr_map = {}
-    for tag, meta in channels_meta.items():
-        tag_sr_map[tag] = meta.get("nominal_srate") or 25.0
-    
-    # Group tags by sampling rate
-    sr_groups: Dict[float, List[str]] = {}
+
+    def tag_type_name(tag: str) -> str:
+        raw = channels_meta.get(tag, {}).get("raw_info", {})
+        # Use the channel "name" (Accelerometer, Gyroscope, PPG, HeartRate, etc.)
+        return raw.get("name") or raw.get("type") or "physio"
+
+    def tag_nominal_sr(tag: str) -> float:
+        # Keep existing default, but now it won't mix types together.
+        return channels_meta.get(tag, {}).get("nominal_srate") or 25.0 ## NOTE THAT THIS IS HARD CODED
+
+    # Build groups keyed by (type_name, sr)
+    groups: Dict[Tuple[str, float], List[str]] = {}
     for tag in df_long["tag"].unique():
-        sr = tag_sr_map.get(tag, 25.0)
-        if sr not in sr_groups:
-            sr_groups[sr] = []
-        sr_groups[sr].append(tag)
-    
-    # Create separate dataframe for each sampling rate group
+        key = (tag_type_name(tag), tag_nominal_sr(tag))
+        groups.setdefault(key, []).append(tag)
+
     result = []
-    for sr, tags_in_group in sr_groups.items():
-        # Filter records for this group
+    for (type_name, sr), tags_in_group in groups.items():
         df_group = df_long[df_long["tag"].isin(tags_in_group)].copy()
-        
         if df_group.empty:
             continue
-        
-        # Create wide format dataframe
+
         df_wide = (
             df_group.pivot_table(index="timestamp", columns="tag", values="value", aggfunc="mean")
             .sort_index()
             .reset_index()
         )
-        
         if df_wide.empty:
             continue
-        
-        # Create a regular timestamp grid for continuous data
-        # Use the nominal sampling rate to create evenly spaced timestamps
+
         min_ts = df_wide["timestamp"].min()
         max_ts = df_wide["timestamp"].max()
-        interval_ms = int(1000.0 / sr)  # milliseconds between samples at this sampling rate
-        
-        # Generate regular timestamp grid
+        interval_ms = int(1000.0 / sr)
+
         regular_timestamps = pd.Series(range(min_ts, max_ts + interval_ms, interval_ms))
-        
-        # Reindex dataframe to regular grid (this creates NAs for missing timestamps)
-        df_wide = df_wide.set_index("timestamp")
-        df_wide = df_wide.reindex(regular_timestamps)
-        df_wide = df_wide.reset_index()
+
+        df_wide = df_wide.set_index("timestamp").reindex(regular_timestamps).reset_index()
         df_wide = df_wide.rename(columns={"index": "timestamp"})
-        
-        # Fill gaps using interpolation strategy:
-        # 1. Forward fill to propagate last known values
-        # 2. Backward fill to fill any leading gaps
-        # 3. Linear interpolation for any remaining gaps
+
         data_cols = [col for col in df_wide.columns if col != "timestamp"]
-        
         for col in data_cols:
-            # Forward fill
             df_wide[col] = df_wide[col].ffill()
-            # Backward fill (for any leading NAs)
             df_wide[col] = df_wide[col].bfill()
-            # Linear interpolation for any remaining gaps (shouldn't be any, but safety)
             if df_wide[col].isna().any():
-                df_wide[col] = df_wide[col].interpolate(method='linear', limit_direction='both')
-            # Final safety: if any NAs remain, fill with 0 (shouldn't happen)
+                df_wide[col] = df_wide[col].interpolate(method="linear", limit_direction="both")
             df_wide[col] = df_wide[col].fillna(0)
-        
-        # Verify no NAs remain
-        assert df_wide[data_cols].isna().sum().sum() == 0, "Data should have no NAs after filling"
-        
-        # Keep column names as tags (matching YQ format - simple tag names, not full labels)
-        # The tags are already unique and readable (e.g., "TP10", "AF8", "EA", "AX", etc.)
-        # No renaming needed - tags are already the column names
-        
-        # Determine type name from channel metadata
-        # Use the channel "name" from the first channel in the group
-        type_name = "physio"
-        if tags_in_group:
-            first_tag = tags_in_group[0]
-            first_meta = channels_meta.get(first_tag, {})
-            raw_info = first_meta.get("raw_info", {})
-            type_name = raw_info.get("name") or raw_info.get("type") or "physio"
-        
+
         result.append((df_wide, sr, type_name, tags_in_group))
+
+    return result
+
     
     return result
 
