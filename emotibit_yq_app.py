@@ -343,7 +343,7 @@ def zip_directory(src_dir: str) -> bytes:
 st.markdown(
     """
     <div class="hero">
-      <div class="hero-title">📦 EmotiBit → You:Quantified converter</div>
+      <div class="hero-title">📦 EmotiBit → YouQuantified converter</div>
       <div class="hero-sub">Drop an EmotiBit export (.zip) → get a YQ-style folder (.zip) you can upload.</div>
     </div>
     """,
