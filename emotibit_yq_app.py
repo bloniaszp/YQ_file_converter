@@ -103,21 +103,31 @@ def load_emotibit_json(json_path: str) -> Tuple[dict, Dict[str, dict]]:
 # --------------------------------------------------
 # 2. CSV parsing
 # --------------------------------------------------
-def parse_emotibit_csv(csv_path: str, device_created_at: str, channels_meta: Dict[str, dict]) -> List[Tuple[pd.DataFrame, float, str, List[str]]]:
+def parse_emotibit_csv(
+    csv_path: str,
+    device_created_at: str,
+    channels_meta: Dict[str, dict],
+) -> List[Tuple[pd.DataFrame, float, str, List[str]]]:
     """
-    Parse EmotiBit CSV and return dataframes grouped by sampling rate.
-    Returns: List of (dataframe, sampling_rate, type_name, tags_in_group) tuples
+    Parse an EmotiBit CSV file and return a list of dataframes grouped by channel type
+    and nominal sampling rate.
     """
+
     base_dt = None
     if device_created_at:
-        base_dt = datetime.strptime(device_created_at, "%Y-%m-%d_%H-%M-%S-%f")
+        try:
+            base_dt = datetime.strptime(device_created_at, "%Y-%m-%d_%H-%M-%S-%f")
+        except ValueError:
+            base_dt = None
 
-    records = []
-    with open(csv_path, "r") as f:
-        for line in f:
-            line = line.strip()
+    records: List[Dict[str, object]] = []
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
             if not line:
                 continue
+
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 7:
                 continue
@@ -128,92 +138,100 @@ def parse_emotibit_csv(csv_path: str, device_created_at: str, channels_meta: Dic
                 continue
 
             tag = parts[3]
+
             try:
                 n_samples = int(parts[2])
             except ValueError:
                 n_samples = 1
 
-            values = parts[6:]
             if tag not in channels_meta:
                 continue
 
             ch_meta = channels_meta.get(tag, {})
             sr = ch_meta.get("nominal_srate") or 25.0
 
-            if base_dt is not None:
-                base_ts = base_dt + timedelta(milliseconds=system_ms)
-                base_ts_ms = int(base_ts.timestamp() * 1000)
-            else:
-                base_ts_ms = system_ms
+            values = parts[6:6 + n_samples]
 
-            for idx, val in enumerate(values[:n_samples]):
+            if base_dt is not None:
+                packet_dt = base_dt + timedelta(milliseconds=system_ms)
+                packet_ts_ms = int(packet_dt.timestamp() * 1000)
+            else:
+                packet_ts_ms = system_ms
+
+            # IMPORTANT:
+            # Treat system_ms as the timestamp of the LAST sample in the packet.
+            # So for a packet with n_samples, assign earlier samples backward in time.
+            for idx, val in enumerate(values):
                 try:
                     v = float(val)
                 except ValueError:
                     continue
-                ts_ms = base_ts_ms + int((idx * 1.0 / sr) * 1000.0)
-                records.append({"timestamp": ts_ms, "tag": tag, "value": v})
+
+                samples_from_end = (n_samples - 1) - idx
+                ts_ms = packet_ts_ms - int((samples_from_end * 1000.0) / sr)
+
+                records.append(
+                    {
+                        "timestamp": ts_ms,
+                        "tag": tag,
+                        "value": v,
+                    }
+                )
 
     if not records:
         return []
 
-    # -----------------------------
-    # Group channels by (type, sampling rate) instead of sampling rate alone
-    # -----------------------------
     df_long = pd.DataFrame.from_records(records)
 
     def tag_type_name(tag: str) -> str:
         raw = channels_meta.get(tag, {}).get("raw_info", {})
-        # Use the channel "name" (Accelerometer, Gyroscope, PPG, HeartRate, etc.)
         return raw.get("name") or raw.get("type") or "physio"
 
     def tag_nominal_sr(tag: str) -> float:
-        # Keep existing default, but now it won't mix types together.
-        return channels_meta.get(tag, {}).get("nominal_srate") or 25.0 ## NOTE THAT THIS IS HARD CODED
+        return channels_meta.get(tag, {}).get("nominal_srate") or 25.0
 
-    # Build groups keyed by (type_name, sr)
     groups: Dict[Tuple[str, float], List[str]] = {}
-    for tag in df_long["tag"].unique():
-        key = (tag_type_name(tag), tag_nominal_sr(tag))
-        groups.setdefault(key, []).append(tag)
+    for tag_name in df_long["tag"].unique():
+        key = (tag_type_name(tag_name), tag_nominal_sr(tag_name))
+        groups.setdefault(key, []).append(tag_name)
 
-    result = []
+    result: List[Tuple[pd.DataFrame, float, str, List[str]]] = []
+
     for (type_name, sr), tags_in_group in groups.items():
         df_group = df_long[df_long["tag"].isin(tags_in_group)].copy()
         if df_group.empty:
             continue
 
         df_wide = (
-            df_group.pivot_table(index="timestamp", columns="tag", values="value", aggfunc="mean")
+            df_group.pivot_table(
+                index="timestamp",
+                columns="tag",
+                values="value",
+                aggfunc="mean",
+            )
             .sort_index()
             .reset_index()
         )
+
         if df_wide.empty:
             continue
 
-        min_ts = df_wide["timestamp"].min()
-        max_ts = df_wide["timestamp"].max()
-        interval_ms = int(1000.0 / sr)
-
-        regular_timestamps = pd.Series(range(min_ts, max_ts + interval_ms, interval_ms))
-
-        df_wide = df_wide.set_index("timestamp").reindex(regular_timestamps).reset_index()
-        df_wide = df_wide.rename(columns={"index": "timestamp"})
-
         data_cols = [col for col in df_wide.columns if col != "timestamp"]
+
+        # Only fill tiny gaps caused by channel asynchrony.
+        # Do not manufacture long stretches of data.
         for col in data_cols:
-            df_wide[col] = df_wide[col].ffill()
-            df_wide[col] = df_wide[col].bfill()
             if df_wide[col].isna().any():
-                df_wide[col] = df_wide[col].interpolate(method="linear", limit_direction="both")
-            df_wide[col] = df_wide[col].fillna(0)
+                df_wide[col] = df_wide[col].interpolate(
+                    method="linear",
+                    limit=1,
+                    limit_direction="both",
+                )
 
         result.append((df_wide, sr, type_name, tags_in_group))
 
     return result
 
-    
-    return result
 
 # --------------------------------------------------
 # 3. YQ writer
@@ -343,7 +361,7 @@ def zip_directory(src_dir: str) -> bytes:
 st.markdown(
     """
     <div class="hero">
-      <div class="hero-title">📦 EmotiBit → You:Quantified converter</div>
+      <div class="hero-title"> EmotiBit → YouQuantified converter</div>
       <div class="hero-sub">Drop an EmotiBit export (.zip) → get a YQ-style folder (.zip) you can upload.</div>
     </div>
     """,
@@ -387,7 +405,7 @@ if uploaded is not None:
             sessions = find_emotibit_sessions(extract_dir)
 
             if not sessions:
-                st.error("😕 I couldn't find any `<something>.csv` + `<something>_info*.json` pair. Check the ZIP and try again.")
+                st.error("I couldn't find any `<something>.csv` + `<something>_info*.json` pair. Check the ZIP and try again.")
             else:
                 yq_out_dir = os.path.join(tmpdir, "YQ_out")
                 os.makedirs(yq_out_dir, exist_ok=True)
@@ -422,7 +440,7 @@ if uploaded is not None:
                 )
 
     except Exception as e:
-        st.error("🚨 Error during conversion.")
+        st.error("Error during conversion.")
         st.exception(e)
 
 # --------------------------------------------------
